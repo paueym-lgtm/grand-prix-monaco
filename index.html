@@ -887,37 +887,69 @@ const ICE_SERVERS = [
   { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
   { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" }
 ];
+
 let voiceOn = false, localStream = null, voiceCtx = null, localAnalyser = null;
 let rtcPeers = {};        // id -> RTCPeerConnection
 let remoteAudioEls = {};  // id -> <audio>
 let remoteAnalysers = {}; // id -> { analyser, data }
+let remoteIceQueues = {}; // id -> ICE candidates reçus avant la remoteDescription
 let speaking = {};        // id -> bool (me.id inclus)
+
 async function toggleVoice() {
   if (!channel || !connected) return;
   if (voiceOn) stopVoice(); else await startVoice();
 }
+
 async function startVoice() {
   try {
-    localStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    localStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
+    });
   } catch (e) {
     setNote("Impossible d'activer le micro (autorisation refusée ou indisponible).");
     return;
   }
+
   voiceOn = true;
   updateVoiceBtn();
   setupLocalAnalyser();
+
   try { await channel.track(presencePayload()); } catch (e) {}
-  for (const id in people) if (id !== me.id && people[id].voice) maybeConnectVoice(id);
+
+  // Connexions vers tous les joueurs qui ont déjà activé leur micro.
+  for (const id in people) {
+    if (id !== me.id && people[id].voice) maybeConnectVoice(id);
+  }
 }
+
 function stopVoice() {
   voiceOn = false;
-  if (localStream) { try { localStream.getTracks().forEach(t => t.stop()); } catch (e) {} localStream = null; }
-  if (voiceCtx) { try { voiceCtx.close(); } catch (e) {} voiceCtx = null; localAnalyser = null; }
+
+  if (localStream) {
+    try { localStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+    localStream = null;
+  }
+
+  if (voiceCtx) {
+    try { voiceCtx.close(); } catch (e) {}
+    voiceCtx = null;
+    localAnalyser = null;
+  }
+
   speaking = {};
   for (const id in rtcPeers) closeVoicePeer(id);
-  if (channel && connected) { try { channel.track(presencePayload()); } catch (e) {} }
+
+  if (channel && connected) {
+    try { channel.track(presencePayload()); } catch (e) {}
+  }
+
   updateVoiceBtn();
 }
+
 function updateVoiceBtn() {
   const b = $("voiceBtn"); if (!b) return;
   b.hidden = !channel || !connected;
@@ -925,94 +957,269 @@ function updateVoiceBtn() {
   b.classList.toggle("speaking", !!speaking[me.id]);
   $("voiceBtnLabel").textContent = voiceOn ? "Voix activée" : "Activer la voix";
 }
+
 function ensurePeer(id) {
   let pc = rtcPeers[id];
   if (pc) return pc;
+
+  remoteIceQueues[id] = remoteIceQueues[id] || [];
+
   pc = rtcPeers[id] = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-  if (localStream) localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-  pc.onicecandidate = e => { if (e.candidate) sendRTC(id, "ice", e.candidate); };
-  pc.ontrack = e => attachRemoteAudio(id, e.streams[0]);
-  pc.onconnectionstatechange = () => { if (["failed", "closed", "disconnected"].includes(pc.connectionState)) closeVoicePeer(id); };
+
+  if (localStream) {
+    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+  }
+
+  pc.onicecandidate = e => {
+    // On envoie aussi la fin des candidats. Cela rend le signalement ICE complet.
+    if (channel) {
+      try {
+        channel.send({
+          type: "broadcast",
+          event: "rtc",
+          payload: { to: id, from: me.id, kind: "ice", data: e.candidate || null }
+        });
+      } catch (err) {}
+    }
+  };
+
+  pc.ontrack = e => {
+    const stream = e.streams && e.streams[0];
+    if (stream) attachRemoteAudio(id, stream);
+  };
+
+  pc.onconnectionstatechange = () => {
+    // "disconnected" peut être temporaire avec WebRTC : on ne détruit donc
+    // la connexion que sur failed/closed.
+    if (["failed", "closed"].includes(pc.connectionState)) {
+      closeVoicePeer(id);
+    }
+  };
+
   return pc;
 }
+
 function sendRTC(to, kind, data) {
-  if (!channel) return;
-  try { channel.send({ type: "broadcast", event: "rtc", payload: { to, from: me.id, kind, data } }); } catch (e) {}
-}
-async function maybeConnectVoice(id) {
-  if (!voiceOn || rtcPeers[id]) return;
-  if (me.id > id) return; // seul l'id le plus petit lance l'offre, pour éviter les doublons
-  const pc = ensurePeer(id);
+  if (!channel || !connected) return;
   try {
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    sendRTC(id, "offer", offer);
+    channel.send({
+      type: "broadcast",
+      event: "rtc",
+      payload: { to, from: me.id, kind, data }
+    });
   } catch (e) {}
 }
+
+async function flushRemoteIce(id, pc) {
+  const queue = remoteIceQueues[id] || [];
+  remoteIceQueues[id] = [];
+
+  for (const candidate of queue) {
+    try {
+      await pc.addIceCandidate(candidate ? new RTCIceCandidate(candidate) : null);
+    } catch (e) {
+      // Une candidate invalide ne doit pas casser toute la connexion.
+      console.warn("[VOICE] ICE candidate ignorée", id, e);
+    }
+  }
+}
+
+async function maybeConnectVoice(id) {
+  if (!voiceOn || !id || id === me.id) return;
+
+  // Un seul côté crée l'offre. L'autre répond.
+  if (me.id > id) return;
+
+  const pc = ensurePeer(id);
+
+  // Une offre existe déjà ou la connexion est déjà négociée.
+  if (pc.signalingState !== "stable") return;
+  if (pc.localDescription) return;
+
+  try {
+    const offer = await pc.createOffer({
+      offerToReceiveAudio: true
+    });
+    await pc.setLocalDescription(offer);
+    sendRTC(id, "offer", pc.localDescription);
+  } catch (e) {
+    console.warn("[VOICE] création de l'offre impossible", id, e);
+  }
+}
+
 async function handleRTC(p) {
-  if (!p || p.to !== me.id || !voiceOn) return;
+  if (!p || p.to !== me.id || !voiceOn || !p.from) return;
+
   const pc = ensurePeer(p.from);
+
   try {
     if (p.kind === "offer") {
+      // Une ancienne offre peut arriver après une reconnexion.
+      if (pc.signalingState !== "stable") {
+        await pc.setLocalDescription({ type: "rollback" }).catch(() => {});
+      }
+
       await pc.setRemoteDescription(new RTCSessionDescription(p.data));
+      await flushRemoteIce(p.from, pc);
+
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      sendRTC(p.from, "answer", answer);
+      sendRTC(p.from, "answer", pc.localDescription);
+
     } else if (p.kind === "answer") {
-      await pc.setRemoteDescription(new RTCSessionDescription(p.data));
+      // L'answer n'est valable que si nous sommes bien en attente d'une answer.
+      if (pc.signalingState === "have-local-offer") {
+        await pc.setRemoteDescription(new RTCSessionDescription(p.data));
+        await flushRemoteIce(p.from, pc);
+      }
+
     } else if (p.kind === "ice") {
-      await pc.addIceCandidate(new RTCIceCandidate(p.data));
+      // IMPORTANT : addIceCandidate() peut échouer si remoteDescription est
+      // encore null. On met donc les candidats en file jusqu'à l'offre/réponse.
+      if (!p.data || pc.remoteDescription) {
+        await pc.addIceCandidate(p.data ? new RTCIceCandidate(p.data) : null);
+      } else {
+        remoteIceQueues[p.from] = remoteIceQueues[p.from] || [];
+        remoteIceQueues[p.from].push(p.data);
+      }
     }
-  } catch (e) {}
+  } catch (e) {
+    console.warn("[VOICE] signalisation WebRTC", p.kind, p.from, e);
+  }
 }
+
 function closeVoicePeer(id) {
   const pc = rtcPeers[id];
   if (pc) { try { pc.close(); } catch (e) {} delete rtcPeers[id]; }
+
+  delete remoteIceQueues[id];
+
   const a = remoteAudioEls[id];
-  if (a) { try { a.srcObject = null; a.remove(); } catch (e) {} delete remoteAudioEls[id]; }
-  delete remoteAnalysers[id]; delete speaking[id];
+  if (a) {
+    try {
+      a.pause();
+      a.srcObject = null;
+      a.remove();
+    } catch (e) {}
+    delete remoteAudioEls[id];
+  }
+
+  delete remoteAnalysers[id];
+  delete speaking[id];
   renderPeople();
 }
+
 function attachRemoteAudio(id, stream) {
   let a = remoteAudioEls[id];
-  if (!a) { a = remoteAudioEls[id] = document.createElement("audio"); a.autoplay = true; a.hidden = true; document.body.appendChild(a); }
+
+  if (!a) {
+    a = remoteAudioEls[id] = document.createElement("audio");
+    a.autoplay = true;
+    a.playsInline = true;
+    a.controls = false;
+    a.volume = 1;
+    a.hidden = true;
+    document.body.appendChild(a);
+  }
+
   a.srcObject = stream;
+
+  // Après getUserMedia, Chrome autorise normalement la lecture audio
+  // distante. On appelle play() explicitement pour éviter qu'un autoplay
+  // silencieux bloque la voix.
+  const playRemote = () => {
+    const p = a.play();
+    if (p && typeof p.catch === "function") {
+      p.catch(err => console.warn("[VOICE] lecture audio distante bloquée", err));
+    }
+  };
+
+  playRemote();
+  a.onloadedmetadata = playRemote;
+
   setupRemoteAnalyser(id, stream);
 }
+
 function ensureVoiceCtx() {
-  if (!voiceCtx) { try { voiceCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { voiceCtx = null; } }
+  if (!voiceCtx) {
+    try {
+      voiceCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (voiceCtx.state === "suspended") voiceCtx.resume().catch(() => {});
+    } catch (e) {
+      voiceCtx = null;
+    }
+  }
   return voiceCtx;
 }
+
 function setupLocalAnalyser() {
   const ctx = ensureVoiceCtx(); if (!ctx || !localStream) return;
   try {
     const src = ctx.createMediaStreamSource(localStream);
-    localAnalyser = ctx.createAnalyser(); localAnalyser.fftSize = 256;
+    localAnalyser = ctx.createAnalyser();
+    localAnalyser.fftSize = 256;
     src.connect(localAnalyser);
   } catch (e) {}
 }
+
 function setupRemoteAnalyser(id, stream) {
   const ctx = ensureVoiceCtx(); if (!ctx) return;
   try {
     const src = ctx.createMediaStreamSource(stream);
-    const analyser = ctx.createAnalyser(); analyser.fftSize = 256;
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 256;
     src.connect(analyser);
-    remoteAnalysers[id] = { analyser, data: new Uint8Array(analyser.frequencyBinCount) };
+    remoteAnalysers[id] = {
+      analyser,
+      data: new Uint8Array(analyser.frequencyBinCount)
+    };
   } catch (e) {}
 }
+
 let lastVoiceCheck = 0;
+
 function pollSpeaking(t) {
-  if (!voiceOn || t - lastVoiceCheck < 120) return; lastVoiceCheck = t;
+  if (!voiceOn || t - lastVoiceCheck < 120) return;
+  lastVoiceCheck = t;
+
   let changed = false;
-  const level = an => { if (!an) return 0; an.analyser.getByteFrequencyData(an.data); let s = 0; for (const v of an.data) s += v; return s / an.data.length; };
+
+  const level = an => {
+    if (!an) return 0;
+    an.analyser.getByteFrequencyData(an.data);
+    let s = 0;
+    for (const v of an.data) s += v;
+    return s / an.data.length;
+  };
+
   const wasMe = !!speaking[me.id];
-  const isMe = localAnalyser ? (() => { const d = new Uint8Array(localAnalyser.frequencyBinCount); localAnalyser.getByteFrequencyData(d); let s = 0; for (const v of d) s += v; return (s / d.length) > 12; })() : false;
-  if (isMe !== wasMe) { speaking[me.id] = isMe; changed = true; }
-  for (const id in remoteAnalysers) {
-    const was = !!speaking[id], is = level(remoteAnalysers[id]) > 12;
-    if (is !== was) { speaking[id] = is; changed = true; }
+
+  const isMe = localAnalyser ? (() => {
+    const d = new Uint8Array(localAnalyser.frequencyBinCount);
+    localAnalyser.getByteFrequencyData(d);
+    let s = 0;
+    for (const v of d) s += v;
+    return (s / d.length) > 12;
+  })() : false;
+
+  if (isMe !== wasMe) {
+    speaking[me.id] = isMe;
+    changed = true;
   }
-  if (changed) { $("voiceBtn") && $("voiceBtn").classList.toggle("speaking", !!speaking[me.id]); if (phase === "lobby") renderPeople(); }
+
+  for (const id in remoteAnalysers) {
+    const was = !!speaking[id];
+    const is = level(remoteAnalysers[id]) > 12;
+    if (is !== was) {
+      speaking[id] = is;
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    $("voiceBtn") && $("voiceBtn").classList.toggle("speaking", !!speaking[me.id]);
+    if (phase === "lobby") renderPeople();
+  }
 }
 
 /* ------------------------------ Réseau (Supabase Realtime) ------------------------------ */
