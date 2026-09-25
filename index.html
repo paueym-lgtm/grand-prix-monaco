@@ -246,7 +246,7 @@
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.107.0"></script>
 <script>
 "use strict";
 
@@ -879,20 +879,29 @@ let roomHostId = null;
 let roomConfig = { trk: trackKey, laps: 3, bots: 5, lvl: 0.95 };
 function presencePayload() { return { name: me.name, color: me.color, joinedAt, roomConfig, voice: voiceOn }; }
 
-/* ------------------------------ Voix entre joueurs (WebRTC) ------------------------------ */
-const ICE_SERVERS = [
-  { urls: "stun:stun.l.google.com:19302" },
-  { urls: "stun:stun1.l.google.com:19302" },
-  { urls: "stun:stun.cloudflare.com:3478" }
-];
+/* ------------------------------ Voix entre joueurs (Supabase Radio) ------------------------------ */
+/*
+   La voix n'utilise plus WebRTC/STUN/TURN.
+   Le micro est converti en PCM mono 16 kHz puis envoyé en binaire
+   par Supabase Realtime Broadcast. Cela évite toute connexion P2P.
+*/
+const VOICE_SAMPLE_RATE = 12000;
+const VOICE_EVENT = "voice-audio";
+const VOICE_TRANSPORT = "base64";
+const VOICE_ID_BYTES = 6;
 
-let voiceOn = false, localStream = null, voiceCtx = null, localAnalyser = null;
-let rtcPeers = {};
-let remoteAudioEls = {};
-let remoteAnalysers = {};
-let remoteIceQueues = {};
+let voiceOn = false;
+let localStream = null;
+let voiceCtx = null;
+let localAnalyser = null;
+let voiceSource = null;
+let voiceProcessor = null;
+let voiceMuteGain = null;
+let remoteVoiceState = {};
+let remoteVoiceAnalysers = {};
+let remoteVoiceGains = {};
+let remoteNextPlayTime = {};
 let speaking = {};
-let voiceNegotiating = {};
 
 async function toggleVoice() {
   if (!channel || !connected) return;
@@ -900,56 +909,103 @@ async function toggleVoice() {
 }
 
 async function startVoice() {
+  if (voiceOn) return;
+
   try {
     localStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
         noiseSuppression: true,
-        autoGainControl: true
+        autoGainControl: true,
+        channelCount: 1
       }
     });
   } catch (e) {
-    console.error("[VOICE] getUserMedia:", e);
+    console.error("[VOICE RADIO] getUserMedia:", e);
     setNote("Impossible d'activer le micro (autorisation refusée ou indisponible).");
     return;
   }
 
-  voiceOn = true;
-  updateVoiceBtn();
-  setupLocalAnalyser();
+  try {
+    voiceCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (voiceCtx.state === "suspended") await voiceCtx.resume();
 
-  try { await channel.track(presencePayload()); } catch (e) {
-    console.warn("[VOICE] présence vocale:", e);
-  }
+    voiceSource = voiceCtx.createMediaStreamSource(localStream);
+    localAnalyser = voiceCtx.createAnalyser();
+    localAnalyser.fftSize = 256;
+    voiceSource.connect(localAnalyser);
 
-  broadcastVoiceHello();
+    // ScriptProcessor est volontairement utilisé ici pour rester compatible
+    // avec Chrome/Edge sans installer quoi que ce soit.
+    voiceProcessor = voiceCtx.createScriptProcessor(2048, 1, 1);
+    voiceMuteGain = voiceCtx.createGain();
+    voiceMuteGain.gain.value = 0;
 
-  for (const id in people) {
-    if (id !== me.id && people[id].voice) maybeConnectVoice(id);
+    voiceSource.connect(voiceProcessor);
+    voiceProcessor.connect(voiceMuteGain);
+    voiceMuteGain.connect(voiceCtx.destination);
+
+    voiceProcessor.onaudioprocess = e => {
+      if (!voiceOn || !channel || !connected) return;
+      const input = e.inputBuffer.getChannelData(0);
+      const pcm = downsampleTo16k(input, voiceCtx.sampleRate);
+      if (pcm.length) broadcastVoicePCM(pcm);
+    };
+
+    voiceOn = true;
+    updateVoiceBtn();
+
+    try {
+      await channel.track(presencePayload());
+    } catch (e) {
+      console.warn("[VOICE RADIO] présence vocale:", e);
+    }
+
+    console.log("[VOICE RADIO] micro activé, transport Supabase actif (JSON/base64)");
+  } catch (e) {
+    console.error("[VOICE RADIO] initialisation audio:", e);
+    try { localStream.getTracks().forEach(t => t.stop()); } catch (_) {}
+    localStream = null;
+    if (voiceCtx) { try { await voiceCtx.close(); } catch (_) {} }
+    voiceCtx = null;
+    setNote("Impossible d'initialiser la voix.");
   }
 }
 
 function stopVoice() {
   voiceOn = false;
 
+  if (voiceProcessor) {
+    try { voiceProcessor.disconnect(); } catch (_) {}
+    voiceProcessor.onaudioprocess = null;
+    voiceProcessor = null;
+  }
+  if (voiceSource) {
+    try { voiceSource.disconnect(); } catch (_) {}
+    voiceSource = null;
+  }
+  if (voiceMuteGain) {
+    try { voiceMuteGain.disconnect(); } catch (_) {}
+    voiceMuteGain = null;
+  }
   if (localStream) {
-    try { localStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+    try { localStream.getTracks().forEach(t => t.stop()); } catch (_) {}
     localStream = null;
   }
-
   if (voiceCtx) {
-    try { voiceCtx.close(); } catch (e) {}
+    try { voiceCtx.close(); } catch (_) {}
     voiceCtx = null;
-    localAnalyser = null;
   }
 
+  localAnalyser = null;
+  remoteVoiceState = {};
+  remoteVoiceAnalysers = {};
+  remoteVoiceGains = {};
+  remoteNextPlayTime = {};
   speaking = {};
-  voiceNegotiating = {};
-
-  for (const id in rtcPeers) closeVoicePeer(id);
 
   if (channel && connected) {
-    try { channel.track(presencePayload()); } catch (e) {}
+    try { channel.track(presencePayload()); } catch (_) {}
   }
 
   updateVoiceBtn();
@@ -960,375 +1016,194 @@ function updateVoiceBtn() {
   b.hidden = !channel || !connected;
   b.setAttribute("aria-pressed", String(voiceOn));
   b.classList.toggle("speaking", !!speaking[me.id]);
-  $("voiceBtnLabel").textContent = voiceOn ? "Voix activée" : "Activer la voix";
+  const label = $("voiceBtnLabel");
+  if (label) label.textContent = voiceOn ? "Voix activée" : "Activer la voix";
 }
 
-function broadcastVoiceHello() {
-  if (!channel || !connected || !voiceOn) return;
+function downsampleTo16k(input, inputRate) {
+  if (!input || !input.length) return new Int16Array(0);
+
+  const ratio = inputRate / VOICE_SAMPLE_RATE;
+  if (ratio <= 1.01) {
+    const out = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i++) {
+      const v = Math.max(-1, Math.min(1, input[i]));
+      out[i] = v < 0 ? v * 32768 : v * 32767;
+    }
+    return out;
+  }
+
+  const newLength = Math.max(1, Math.floor(input.length / ratio));
+  const out = new Int16Array(newLength);
+
+  for (let i = 0; i < newLength; i++) {
+    const start = Math.floor(i * ratio);
+    const end = Math.min(input.length, Math.floor((i + 1) * ratio));
+    let sum = 0;
+    let count = 0;
+    for (let j = start; j < end; j++) {
+      sum += input[j];
+      count++;
+    }
+    const v = Math.max(-1, Math.min(1, count ? sum / count : 0));
+    out[i] = v < 0 ? v * 32768 : v * 32767;
+  }
+
+  return out;
+}
+
+function int16ToBase64(pcm) {
+  const bytes = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + CHUNK, bytes.length)));
+  }
+  return btoa(binary);
+}
+
+function base64ToInt16(b64) {
+  try {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
+  } catch (e) {
+    console.warn("[VOICE RADIO] décodage audio:", e);
+    return null;
+  }
+}
+
+function broadcastVoicePCM(pcm) {
+  if (!channel || !connected || !voiceOn || !pcm || !pcm.length) return;
+
+  const id = String(me.id || "").slice(0, VOICE_ID_BYTES);
+  const payload = {
+    t: VOICE_TRANSPORT,
+    from: id,
+    rate: VOICE_SAMPLE_RATE,
+    audio: int16ToBase64(pcm)
+  };
 
   try {
     const result = channel.send({
       type: "broadcast",
-      event: "voice-hello",
-      payload: { from: me.id }
+      event: VOICE_EVENT,
+      payload
     });
-
     if (result && typeof result.catch === "function") {
-      result.catch(e => console.warn("[VOICE] voice-hello non envoyé:", e));
+      result.catch(e => console.warn("[VOICE RADIO] envoi audio:", e));
     }
   } catch (e) {
-    console.warn("[VOICE] voice-hello:", e);
+    console.warn("[VOICE RADIO] envoi audio:", e);
   }
 }
+function binaryToUint8(payload) {
+  if (payload instanceof ArrayBuffer) return new Uint8Array(payload);
+  if (ArrayBuffer.isView(payload)) {
+    return new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength);
+  }
+  if (payload && payload.data instanceof ArrayBuffer) return new Uint8Array(payload.data);
+  return null;
+}
 
-function ensurePeer(id) {
-  let pc = rtcPeers[id];
-  if (pc) return pc;
+function handleVoicePayload(payload) {
+  if (!voiceOn || !payload || payload.t !== VOICE_TRANSPORT) return;
+  const from = String(payload.from || "").slice(0, VOICE_ID_BYTES);
+  if (!from || from === me.id || typeof payload.audio !== "string") return;
 
-  remoteIceQueues[id] = remoteIceQueues[id] || [];
+  const pcm = base64ToInt16(payload.audio);
+  if (!pcm || !pcm.length) return;
+  playRemotePCM(from, pcm, Number(payload.rate) || VOICE_SAMPLE_RATE);
+}
+function playRemotePCM(id, pcm, sampleRate) {
+  if (!voiceCtx || voiceCtx.state === "closed") return;
 
-  pc = rtcPeers[id] = new RTCPeerConnection({
-    iceServers: ICE_SERVERS,
-    iceTransportPolicy: "all"
+  if (voiceCtx.state === "suspended") {
+    voiceCtx.resume().catch(() => {});
+  }
+
+  if (!pcm || !pcm.length) return;
+
+  const buffer = voiceCtx.createBuffer(1, pcm.length, sampleRate || VOICE_SAMPLE_RATE);
+  const channelData = buffer.getChannelData(0);
+
+  let sum = 0;
+  for (let i = 0; i < pcm.length; i++) {
+    const v = pcm[i] / 32768;
+    channelData[i] = v;
+    sum += Math.abs(v);
+  }
+
+  const average = sum / pcm.length;
+  speaking[id] = average > 0.015;
+
+  if (!remoteVoiceGains[id]) {
+    const gain = voiceCtx.createGain();
+    gain.gain.value = 1;
+    const analyser = voiceCtx.createAnalyser();
+    analyser.fftSize = 256;
+    gain.connect(analyser);
+    analyser.connect(voiceCtx.destination);
+    remoteVoiceGains[id] = gain;
+    remoteVoiceAnalysers[id] = analyser;
+  }
+
+  const source = voiceCtx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(remoteVoiceGains[id]);
+
+  const now = voiceCtx.currentTime;
+  let when = remoteNextPlayTime[id] || 0;
+  if (when < now + 0.04) when = now + 0.04;
+
+  source.start(when);
+  remoteNextPlayTime[id] = when + buffer.duration;
+
+  source.onended = () => {
+    try { source.disconnect(); } catch (_) {}
+  };
+
+  remoteVoiceState[id] = performance.now();
+  if (phase === "lobby") renderPeople();
+}
+
+function setupVoiceBroadcast() {
+  if (!channel) return;
+
+  // L'écoute est installée une seule fois sur le canal du jeu.
+  channel.on("broadcast", { event: VOICE_EVENT }, m => {
+    handleVoicePayload(m && m.payload);
   });
-
-  console.log("[VOICE] PeerConnection créée:", id);
-
-  if (localStream) {
-    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-  }
-
-  pc.onicecandidate = e => {
-    if (e.candidate) {
-      console.log("[VOICE] ICE local:", id, e.candidate.type, e.candidate.protocol);
-      sendRTC(id, "ice", e.candidate.toJSON());
-    } else {
-      console.log("[VOICE] ICE local terminé:", id);
-    }
-  };
-
-  pc.onicecandidateerror = e => {
-    console.warn(
-      "[VOICE] ERREUR ICE:",
-      id,
-      "code=", e.errorCode,
-      "url=", e.url,
-      "text=", e.errorText
-    );
-  };
-
-  pc.oniceconnectionstatechange = () => {
-    console.log("[VOICE] ICE", id, pc.iceConnectionState);
-
-    if (pc.iceConnectionState === "failed") {
-      console.error("[VOICE] ICE FAILED:", id,
-        "gathering=", pc.iceGatheringState,
-        "signaling=", pc.signalingState
-      );
-    }
-  };
-
-  pc.onconnectionstatechange = () => {
-    console.log("[VOICE] connexion", id, pc.connectionState);
-
-    if (["failed", "closed"].includes(pc.connectionState)) {
-      closeVoicePeer(id);
-    }
-  };
-
-  pc.onsignalingstatechange = () => {
-    console.log("[VOICE] signalisation", id, pc.signalingState);
-  };
-
-  pc.onicegatheringstatechange = () => {
-    console.log("[VOICE] ICE gathering", id, pc.iceGatheringState);
-  };
-
-  pc.ontrack = e => {
-    const stream = e.streams && e.streams[0];
-    console.log("[VOICE] piste distante reçue:", id, stream);
-    if (stream) attachRemoteAudio(id, stream);
-  };
-
-  return pc;
-}
-
-async function sendRTC(to, kind, data) {
-  if (!channel || !connected) return false;
-
-  try {
-    const result = await channel.send({
-      type: "broadcast",
-      event: "rtc",
-      payload: {
-        to,
-        from: me.id,
-        kind,
-        data
-      }
-    });
-
-    if (result && result !== "ok") {
-      console.warn("[VOICE] Supabase RTC:", result);
-    }
-
-    return true;
-  } catch (e) {
-    console.error("[VOICE] envoi RTC impossible:", kind, to, e);
-    return false;
-  }
-}
-
-function waitForIceGatheringComplete(pc) {
-  if (pc.iceGatheringState === "complete") return Promise.resolve();
-
-  return new Promise(resolve => {
-    const timeout = setTimeout(() => {
-      console.warn("[VOICE] délai ICE atteint, envoi du SDP actuel");
-      resolve();
-    }, 5000);
-
-    const check = () => {
-      if (pc.iceGatheringState === "complete") {
-        clearTimeout(timeout);
-        pc.removeEventListener("icegatheringstatechange", check);
-        resolve();
-      }
-    };
-
-    pc.addEventListener("icegatheringstatechange", check);
-  });
-}
-
-async function flushRemoteIce(id, pc) {
-  const queue = remoteIceQueues[id] || [];
-  remoteIceQueues[id] = [];
-
-  for (const candidate of queue) {
-    try {
-      await pc.addIceCandidate(new RTCIceCandidate(candidate));
-    } catch (e) {
-      console.warn("[VOICE] ICE candidate refusée:", id, e);
-    }
-  }
-}
-
-async function maybeConnectVoice(id) {
-  if (!voiceOn || !id || id === me.id) return;
-  if (me.id > id) return;
-  if (voiceNegotiating[id]) return;
-
-  const pc = ensurePeer(id);
-
-  if (pc.signalingState !== "stable") return;
-
-  voiceNegotiating[id] = true;
-
-  try {
-    console.log("[VOICE] création offre vers", id);
-
-    const offer = await pc.createOffer({ offerToReceiveAudio: true });
-    await pc.setLocalDescription(offer);
-
-    // On attend que les candidats ICE soient intégrés au SDP.
-    // Cela évite qu'un message ICE arrive hors ordre via le canal de signalisation.
-    await waitForIceGatheringComplete(pc);
-
-    const description = {
-      type: pc.localDescription.type,
-      sdp: pc.localDescription.sdp
-    };
-
-    console.log("[VOICE] offre complète envoyée vers", id);
-    await sendRTC(id, "offer", description);
-
-  } catch (e) {
-    console.error("[VOICE] création/envoi offre:", id, e);
-  } finally {
-    voiceNegotiating[id] = false;
-  }
-}
-
-async function handleVoiceHello(p) {
-  if (!p || !p.from || p.from === me.id || !voiceOn) return;
-
-  console.log("[VOICE] hello reçu de", p.from);
-
-  if (me.id < p.from) {
-    await maybeConnectVoice(p.from);
-  }
-}
-
-async function handleRTC(p) {
-  if (!p || p.to !== me.id || !p.from || !voiceOn) return;
-
-  const pc = ensurePeer(p.from);
-
-  try {
-    if (p.kind === "offer") {
-      console.log("[VOICE] offre reçue de", p.from);
-
-      if (pc.signalingState !== "stable") {
-        try { await pc.setLocalDescription({ type: "rollback" }); }
-        catch (rollbackError) {
-          console.warn("[VOICE] rollback:", rollbackError);
-        }
-      }
-
-      await pc.setRemoteDescription(new RTCSessionDescription(p.data));
-      await flushRemoteIce(p.from, pc);
-
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-
-      await waitForIceGatheringComplete(pc);
-
-      const description = {
-        type: pc.localDescription.type,
-        sdp: pc.localDescription.sdp
-      };
-
-      console.log("[VOICE] réponse complète envoyée à", p.from);
-      await sendRTC(p.from, "answer", description);
-
-    } else if (p.kind === "answer") {
-      console.log("[VOICE] réponse reçue de", p.from);
-
-      if (pc.signalingState !== "have-local-offer") {
-        console.warn("[VOICE] réponse ignorée : état", pc.signalingState);
-        return;
-      }
-
-      await pc.setRemoteDescription(new RTCSessionDescription(p.data));
-      await flushRemoteIce(p.from, pc);
-
-    } else if (p.kind === "ice") {
-      // Gardé pour compatibilité avec les clients qui utilisent encore le trickle ICE.
-      if (!p.data) return;
-
-      if (pc.remoteDescription) {
-        await pc.addIceCandidate(new RTCIceCandidate(p.data));
-      } else {
-        remoteIceQueues[p.from] = remoteIceQueues[p.from] || [];
-        remoteIceQueues[p.from].push(p.data);
-        console.log("[VOICE] ICE mis en attente:", p.from);
-      }
-    }
-  } catch (e) {
-    console.error("[VOICE] signalisation WebRTC:", p.kind, p.from, e);
-  }
-}
-
-function closeVoicePeer(id) {
-  const pc = rtcPeers[id];
-
-  if (pc) {
-    try { pc.close(); } catch (e) {}
-    delete rtcPeers[id];
-  }
-
-  delete remoteIceQueues[id];
-  delete voiceNegotiating[id];
-
-  const a = remoteAudioEls[id];
-  if (a) {
-    try {
-      a.pause();
-      a.srcObject = null;
-      a.remove();
-    } catch (e) {}
-    delete remoteAudioEls[id];
-  }
-
-  delete remoteAnalysers[id];
-  delete speaking[id];
-
-  renderPeople();
-}
-
-function attachRemoteAudio(id, stream) {
-  let a = remoteAudioEls[id];
-
-  if (!a) {
-    a = remoteAudioEls[id] = document.createElement("audio");
-    a.autoplay = true;
-    a.playsInline = true;
-    a.controls = false;
-    a.volume = 1;
-    a.style.position = "fixed";
-    a.style.width = "1px";
-    a.style.height = "1px";
-    a.style.opacity = "0";
-    a.style.pointerEvents = "none";
-    document.body.appendChild(a);
-  }
-
-  a.srcObject = stream;
-
-  const playRemote = async () => {
-    try {
-      await a.play();
-      console.log("[VOICE] lecture distante OK:", id);
-    } catch (err) {
-      console.warn("[VOICE] lecture distante bloquée:", id, err);
-      setNote("La voix distante est reçue mais la lecture audio est bloquée par le navigateur.");
-    }
-  };
-
-  playRemote();
-
-  a.onloadedmetadata = playRemote;
-
-  setupRemoteAnalyser(id, stream);
 }
 
 function ensureVoiceCtx() {
   if (!voiceCtx) {
     try {
       voiceCtx = new (window.AudioContext || window.webkitAudioContext)();
-      if (voiceCtx.state === "suspended") {
-        voiceCtx.resume().catch(e => console.warn("[VOICE] AudioContext:", e));
-      }
+      if (voiceCtx.state === "suspended") voiceCtx.resume().catch(() => {});
     } catch (e) {
-      console.warn("[VOICE] AudioContext indisponible:", e);
+      console.warn("[VOICE RADIO] AudioContext indisponible:", e);
       voiceCtx = null;
     }
   }
-
   return voiceCtx;
 }
 
 function setupLocalAnalyser() {
-  const ctx = ensureVoiceCtx();
-  if (!ctx || !localStream) return;
-
+  if (!voiceCtx || !localStream) return;
   try {
-    const src = ctx.createMediaStreamSource(localStream);
-    localAnalyser = ctx.createAnalyser();
+    if (!voiceSource) voiceSource = voiceCtx.createMediaStreamSource(localStream);
+    localAnalyser = voiceCtx.createAnalyser();
     localAnalyser.fftSize = 256;
-    src.connect(localAnalyser);
+    voiceSource.connect(localAnalyser);
   } catch (e) {
-    console.warn("[VOICE] analyse micro:", e);
+    console.warn("[VOICE RADIO] analyse micro:", e);
   }
 }
 
-function setupRemoteAnalyser(id, stream) {
-  const ctx = ensureVoiceCtx();
-  if (!ctx) return;
-
-  try {
-    const src = ctx.createMediaStreamSource(stream);
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 256;
-    src.connect(analyser);
-
-    remoteAnalysers[id] = {
-      analyser,
-      data: new Uint8Array(analyser.frequencyBinCount)
-    };
-  } catch (e) {
-    console.warn("[VOICE] analyse distante:", id, e);
-  }
+function setupRemoteAnalyser() {
+  // Conservé pour compatibilité avec le reste du jeu.
 }
 
 let lastVoiceCheck = 0;
@@ -1339,49 +1214,33 @@ function pollSpeaking(t) {
 
   let changed = false;
 
-  const level = an => {
-    if (!an) return 0;
-    an.analyser.getByteFrequencyData(an.data);
-
-    let s = 0;
-    for (const v of an.data) s += v;
-
-    return s / an.data.length;
-  };
-
-  const wasMe = !!speaking[me.id];
-
-  const isMe = localAnalyser ? (() => {
+  if (localAnalyser) {
     const d = new Uint8Array(localAnalyser.frequencyBinCount);
     localAnalyser.getByteFrequencyData(d);
-
-    let s = 0;
-    for (const v of d) s += v;
-
-    return (s / d.length) > 12;
-  })() : false;
-
-  if (isMe !== wasMe) {
-    speaking[me.id] = isMe;
-    changed = true;
+    let sum = 0;
+    for (const v of d) sum += v;
+    const isMe = (sum / d.length) > 12;
+    if (!!speaking[me.id] !== isMe) {
+      speaking[me.id] = isMe;
+      changed = true;
+    }
   }
 
-  for (const id in remoteAnalysers) {
-    const was = !!speaking[id];
-    const is = level(remoteAnalysers[id]) > 12;
-
-    if (is !== was) {
-      speaking[id] = is;
+  const now = performance.now();
+  for (const id in speaking) {
+    if (id === me.id) continue;
+    if (speaking[id] && now - (remoteVoiceState[id] || 0) > 250) {
+      speaking[id] = false;
       changed = true;
     }
   }
 
   if (changed) {
-    $("voiceBtn") && $("voiceBtn").classList.toggle("speaking", !!speaking[me.id]);
+    const btn = $("voiceBtn");
+    if (btn) btn.classList.toggle("speaking", !!speaking[me.id]);
     if (phase === "lobby") renderPeople();
   }
 }
-
 
 /* ------------------------------ Réseau (Supabase Realtime) ------------------------------ */
 function disconnect() {
@@ -1399,6 +1258,7 @@ function connect(code) {
   try {
     client = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { realtime: { params: { eventsPerSecond: 20 } } });
     channel = client.channel("gp3d-" + code, { config: { broadcast: { self: false, ack: false }, presence: { key: me.id } } });
+setupVoiceBroadcast();
   } catch (e) {
     joinStatus("La configuration Supabase n'est pas valide. Vérifie l'URL et la clé.");
     disconnect(); return;
@@ -1406,8 +1266,6 @@ function connect(code) {
   const ch = channel;
   ch.on("broadcast", { event: "s" }, m => onState(m.payload))
     .on("broadcast", { event: "go" }, m => onStart(m.payload))
-    .on("broadcast", { event: "voice-hello" }, m => handleVoiceHello(m.payload))
-    .on("broadcast", { event: "rtc" }, m => handleRTC(m.payload))
     .on("presence", { event: "sync" }, syncPeople);
   const timer = setTimeout(() => {
     if (ch === channel && !connected) {
@@ -1421,7 +1279,6 @@ function connect(code) {
       clearTimeout(timer); connected = true;
       try { await ch.track(presencePayload()); } catch (e) {}
       syncPeople(); enterLobby(); updateVoiceBtn();
-      if (voiceOn) broadcastVoiceHello();
     } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
       if (!connected) {
         clearTimeout(timer);
@@ -1459,7 +1316,6 @@ function syncPeople() {
   people = next;
   for (const id in remotes) if (id[0] !== "b" && !people[id]) delete remotes[id];
   for (const id in rtcPeers) if (!people[id]) closeVoicePeer(id);
-  if (voiceOn) for (const id in people) if (id !== me.id && people[id].voice) maybeConnectVoice(id);
   for (const id in rtcPeers) if (people[id] && !people[id].voice) closeVoicePeer(id);
   updateRoomControls();
   if (phase === "lobby") renderPeople();
