@@ -889,11 +889,11 @@ const ICE_SERVERS = [
 ];
 
 let voiceOn = false, localStream = null, voiceCtx = null, localAnalyser = null;
-let rtcPeers = {};        // id -> RTCPeerConnection
-let remoteAudioEls = {};  // id -> <audio>
-let remoteAnalysers = {}; // id -> { analyser, data }
-let remoteIceQueues = {}; // id -> ICE candidates reçus avant la remoteDescription
-let speaking = {};        // id -> bool (me.id inclus)
+let rtcPeers = {};
+let remoteAudioEls = {};
+let remoteAnalysers = {};
+let remoteIceQueues = {};
+let speaking = {};
 
 async function toggleVoice() {
   if (!channel || !connected) return;
@@ -910,6 +910,7 @@ async function startVoice() {
       }
     });
   } catch (e) {
+    console.error("[VOICE] getUserMedia:", e);
     setNote("Impossible d'activer le micro (autorisation refusée ou indisponible).");
     return;
   }
@@ -918,9 +919,18 @@ async function startVoice() {
   updateVoiceBtn();
   setupLocalAnalyser();
 
-  try { await channel.track(presencePayload()); } catch (e) {}
+  try {
+    await channel.track(presencePayload());
+  } catch (e) {
+    console.warn("[VOICE] présence vocale:", e);
+  }
 
-  // Connexions vers tous les joueurs qui ont déjà activé leur micro.
+  // IMPORTANT :
+  // Le démarrage de WebRTC ne dépend plus de Presence.
+  // On annonce explicitement notre présence vocale par Broadcast.
+  broadcastVoiceHello();
+
+  // Cas où certains joueurs ont déjà activé leur voix.
   for (const id in people) {
     if (id !== me.id && people[id].voice) maybeConnectVoice(id);
   }
@@ -941,6 +951,7 @@ function stopVoice() {
   }
 
   speaking = {};
+
   for (const id in rtcPeers) closeVoicePeer(id);
 
   if (channel && connected) {
@@ -958,6 +969,24 @@ function updateVoiceBtn() {
   $("voiceBtnLabel").textContent = voiceOn ? "Voix activée" : "Activer la voix";
 }
 
+function broadcastVoiceHello() {
+  if (!channel || !connected || !voiceOn) return;
+
+  try {
+    const result = channel.send({
+      type: "broadcast",
+      event: "voice-hello",
+      payload: { from: me.id }
+    });
+
+    if (result && typeof result.catch === "function") {
+      result.catch(e => console.warn("[VOICE] voice-hello non envoyé:", e));
+    }
+  } catch (e) {
+    console.warn("[VOICE] voice-hello:", e);
+  }
+}
+
 function ensurePeer(id) {
   let pc = rtcPeers[id];
   if (pc) return pc;
@@ -966,48 +995,67 @@ function ensurePeer(id) {
 
   pc = rtcPeers[id] = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
+  console.log("[VOICE] PeerConnection créée:", id);
+
   if (localStream) {
     localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
   }
 
   pc.onicecandidate = e => {
-    // On envoie aussi la fin des candidats. Cela rend le signalement ICE complet.
-    if (channel) {
-      try {
-        channel.send({
-          type: "broadcast",
-          event: "rtc",
-          payload: { to: id, from: me.id, kind: "ice", data: e.candidate || null }
-        });
-      } catch (err) {}
-    }
+    // Envoie les candidats au fur et à mesure.
+    // Le candidat null marque la fin de la collecte ICE.
+    sendRTC(id, "ice", e.candidate ? e.candidate.toJSON() : null);
   };
 
   pc.ontrack = e => {
     const stream = e.streams && e.streams[0];
+    console.log("[VOICE] piste distante reçue:", id, stream);
     if (stream) attachRemoteAudio(id, stream);
   };
 
+  pc.oniceconnectionstatechange = () => {
+    console.log("[VOICE] ICE", id, pc.iceConnectionState);
+  };
+
   pc.onconnectionstatechange = () => {
-    // "disconnected" peut être temporaire avec WebRTC : on ne détruit donc
-    // la connexion que sur failed/closed.
+    console.log("[VOICE] connexion", id, pc.connectionState);
+
     if (["failed", "closed"].includes(pc.connectionState)) {
       closeVoicePeer(id);
     }
   };
 
+  pc.onsignalingstatechange = () => {
+    console.log("[VOICE] signalisation", id, pc.signalingState);
+  };
+
   return pc;
 }
 
-function sendRTC(to, kind, data) {
-  if (!channel || !connected) return;
+async function sendRTC(to, kind, data) {
+  if (!channel || !connected) return false;
+
   try {
-    channel.send({
+    const result = await channel.send({
       type: "broadcast",
       event: "rtc",
-      payload: { to, from: me.id, kind, data }
+      payload: {
+        to,
+        from: me.id,
+        kind,
+        data
+      }
     });
-  } catch (e) {}
+
+    if (result && result !== "ok") {
+      console.warn("[VOICE] Supabase RTC:", result);
+    }
+
+    return true;
+  } catch (e) {
+    console.error("[VOICE] envoi RTC impossible:", kind, to, e);
+    return false;
+  }
 }
 
 async function flushRemoteIce(id, pc) {
@@ -1016,10 +1064,9 @@ async function flushRemoteIce(id, pc) {
 
   for (const candidate of queue) {
     try {
-      await pc.addIceCandidate(candidate ? new RTCIceCandidate(candidate) : null);
+      await pc.addIceCandidate(new RTCIceCandidate(candidate));
     } catch (e) {
-      // Une candidate invalide ne doit pas casser toute la connexion.
-      console.warn("[VOICE] ICE candidate ignorée", id, e);
+      console.warn("[VOICE] ICE candidate refusée:", id, e);
     }
   }
 }
@@ -1027,36 +1074,58 @@ async function flushRemoteIce(id, pc) {
 async function maybeConnectVoice(id) {
   if (!voiceOn || !id || id === me.id) return;
 
-  // Un seul côté crée l'offre. L'autre répond.
+  // Un seul des deux joueurs crée l'offre.
   if (me.id > id) return;
 
   const pc = ensurePeer(id);
 
-  // Une offre existe déjà ou la connexion est déjà négociée.
   if (pc.signalingState !== "stable") return;
-  if (pc.localDescription) return;
 
   try {
+    console.log("[VOICE] création offre vers", id);
+
     const offer = await pc.createOffer({
       offerToReceiveAudio: true
     });
+
     await pc.setLocalDescription(offer);
-    sendRTC(id, "offer", pc.localDescription);
+
+    await sendRTC(id, "offer", {
+      type: pc.localDescription.type,
+      sdp: pc.localDescription.sdp
+    });
   } catch (e) {
-    console.warn("[VOICE] création de l'offre impossible", id, e);
+    console.error("[VOICE] création/envoi offre:", id, e);
+  }
+}
+
+async function handleVoiceHello(p) {
+  if (!p || !p.from || p.from === me.id || !voiceOn) return;
+
+  console.log("[VOICE] hello reçu de", p.from);
+
+  // L'unique côté autorisé à créer l'offre démarre maintenant.
+  if (me.id < p.from) {
+    await maybeConnectVoice(p.from);
   }
 }
 
 async function handleRTC(p) {
-  if (!p || p.to !== me.id || !voiceOn || !p.from) return;
+  if (!p || p.to !== me.id || !p.from || !voiceOn) return;
 
   const pc = ensurePeer(p.from);
 
   try {
     if (p.kind === "offer") {
-      // Une ancienne offre peut arriver après une reconnexion.
+      console.log("[VOICE] offre reçue de", p.from);
+
+      // Si une ancienne négociation existe, on revient à l'état stable.
       if (pc.signalingState !== "stable") {
-        await pc.setLocalDescription({ type: "rollback" }).catch(() => {});
+        try {
+          await pc.setLocalDescription({ type: "rollback" });
+        } catch (rollbackError) {
+          console.warn("[VOICE] rollback:", rollbackError);
+        }
       }
 
       await pc.setRemoteDescription(new RTCSessionDescription(p.data));
@@ -1064,33 +1133,48 @@ async function handleRTC(p) {
 
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      sendRTC(p.from, "answer", pc.localDescription);
+
+      await sendRTC(p.from, "answer", {
+        type: pc.localDescription.type,
+        sdp: pc.localDescription.sdp
+      });
 
     } else if (p.kind === "answer") {
-      // L'answer n'est valable que si nous sommes bien en attente d'une answer.
-      if (pc.signalingState === "have-local-offer") {
-        await pc.setRemoteDescription(new RTCSessionDescription(p.data));
-        await flushRemoteIce(p.from, pc);
+      console.log("[VOICE] réponse reçue de", p.from);
+
+      if (pc.signalingState !== "have-local-offer") {
+        console.warn("[VOICE] réponse ignorée : état", pc.signalingState);
+        return;
       }
 
+      await pc.setRemoteDescription(new RTCSessionDescription(p.data));
+      await flushRemoteIce(p.from, pc);
+
     } else if (p.kind === "ice") {
-      // IMPORTANT : addIceCandidate() peut échouer si remoteDescription est
-      // encore null. On met donc les candidats en file jusqu'à l'offre/réponse.
-      if (!p.data || pc.remoteDescription) {
-        await pc.addIceCandidate(p.data ? new RTCIceCandidate(p.data) : null);
+      // Un ICE peut arriver AVANT l'offre/réponse.
+      // Dans ce cas on le garde jusqu'à setRemoteDescription().
+      if (!p.data) return;
+
+      if (pc.remoteDescription) {
+        await pc.addIceCandidate(new RTCIceCandidate(p.data));
       } else {
         remoteIceQueues[p.from] = remoteIceQueues[p.from] || [];
         remoteIceQueues[p.from].push(p.data);
+        console.log("[VOICE] ICE mis en attente:", p.from);
       }
     }
   } catch (e) {
-    console.warn("[VOICE] signalisation WebRTC", p.kind, p.from, e);
+    console.error("[VOICE] signalisation WebRTC:", p.kind, p.from, e);
   }
 }
 
 function closeVoicePeer(id) {
   const pc = rtcPeers[id];
-  if (pc) { try { pc.close(); } catch (e) {} delete rtcPeers[id]; }
+
+  if (pc) {
+    try { pc.close(); } catch (e) {}
+    delete rtcPeers[id];
+  }
 
   delete remoteIceQueues[id];
 
@@ -1106,6 +1190,7 @@ function closeVoicePeer(id) {
 
   delete remoteAnalysers[id];
   delete speaking[id];
+
   renderPeople();
 }
 
@@ -1118,24 +1203,31 @@ function attachRemoteAudio(id, stream) {
     a.playsInline = true;
     a.controls = false;
     a.volume = 1;
-    a.hidden = true;
+    a.style.position = "fixed";
+    a.style.width = "1px";
+    a.style.height = "1px";
+    a.style.opacity = "0";
+    a.style.pointerEvents = "none";
     document.body.appendChild(a);
   }
 
   a.srcObject = stream;
 
-  // Après getUserMedia, Chrome autorise normalement la lecture audio
-  // distante. On appelle play() explicitement pour éviter qu'un autoplay
-  // silencieux bloque la voix.
-  const playRemote = () => {
-    const p = a.play();
-    if (p && typeof p.catch === "function") {
-      p.catch(err => console.warn("[VOICE] lecture audio distante bloquée", err));
+  const playRemote = async () => {
+    try {
+      await a.play();
+      console.log("[VOICE] lecture distante OK:", id);
+    } catch (err) {
+      console.warn("[VOICE] lecture distante bloquée:", id, err);
+      setNote("La voix distante est reçue mais la lecture audio est bloquée par le navigateur.");
     }
   };
 
   playRemote();
-  a.onloadedmetadata = playRemote;
+
+  a.onloadedmetadata = () => {
+    playRemote();
+  };
 
   setupRemoteAnalyser(id, stream);
 }
@@ -1144,36 +1236,50 @@ function ensureVoiceCtx() {
   if (!voiceCtx) {
     try {
       voiceCtx = new (window.AudioContext || window.webkitAudioContext)();
-      if (voiceCtx.state === "suspended") voiceCtx.resume().catch(() => {});
+
+      if (voiceCtx.state === "suspended") {
+        voiceCtx.resume().catch(e => console.warn("[VOICE] AudioContext:", e));
+      }
     } catch (e) {
+      console.warn("[VOICE] AudioContext indisponible:", e);
       voiceCtx = null;
     }
   }
+
   return voiceCtx;
 }
 
 function setupLocalAnalyser() {
-  const ctx = ensureVoiceCtx(); if (!ctx || !localStream) return;
+  const ctx = ensureVoiceCtx();
+  if (!ctx || !localStream) return;
+
   try {
     const src = ctx.createMediaStreamSource(localStream);
     localAnalyser = ctx.createAnalyser();
     localAnalyser.fftSize = 256;
     src.connect(localAnalyser);
-  } catch (e) {}
+  } catch (e) {
+    console.warn("[VOICE] analyse micro:", e);
+  }
 }
 
 function setupRemoteAnalyser(id, stream) {
-  const ctx = ensureVoiceCtx(); if (!ctx) return;
+  const ctx = ensureVoiceCtx();
+  if (!ctx) return;
+
   try {
     const src = ctx.createMediaStreamSource(stream);
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 256;
     src.connect(analyser);
+
     remoteAnalysers[id] = {
       analyser,
       data: new Uint8Array(analyser.frequencyBinCount)
     };
-  } catch (e) {}
+  } catch (e) {
+    console.warn("[VOICE] analyse distante:", id, e);
+  }
 }
 
 let lastVoiceCheck = 0;
@@ -1186,9 +1292,12 @@ function pollSpeaking(t) {
 
   const level = an => {
     if (!an) return 0;
+
     an.analyser.getByteFrequencyData(an.data);
+
     let s = 0;
     for (const v of an.data) s += v;
+
     return s / an.data.length;
   };
 
@@ -1197,8 +1306,10 @@ function pollSpeaking(t) {
   const isMe = localAnalyser ? (() => {
     const d = new Uint8Array(localAnalyser.frequencyBinCount);
     localAnalyser.getByteFrequencyData(d);
+
     let s = 0;
     for (const v of d) s += v;
+
     return (s / d.length) > 12;
   })() : false;
 
@@ -1210,6 +1321,7 @@ function pollSpeaking(t) {
   for (const id in remoteAnalysers) {
     const was = !!speaking[id];
     const is = level(remoteAnalysers[id]) > 12;
+
     if (is !== was) {
       speaking[id] = is;
       changed = true;
@@ -1218,7 +1330,10 @@ function pollSpeaking(t) {
 
   if (changed) {
     $("voiceBtn") && $("voiceBtn").classList.toggle("speaking", !!speaking[me.id]);
-    if (phase === "lobby") renderPeople();
+
+    if (phase === "lobby") {
+      renderPeople();
+    }
   }
 }
 
@@ -1245,7 +1360,9 @@ function connect(code) {
   const ch = channel;
   ch.on("broadcast", { event: "s" }, m => onState(m.payload))
     .on("broadcast", { event: "go" }, m => onStart(m.payload))
+    .on("broadcast", { event: "voice-hello" }, m => handleVoiceHello(m.payload))
     .on("broadcast", { event: "rtc" }, m => handleRTC(m.payload))
+  .on("broadcast", { event: "voice-hello" }, m => handleVoiceHello(m.payload))
     .on("presence", { event: "sync" }, syncPeople);
   const timer = setTimeout(() => {
     if (ch === channel && !connected) {
@@ -1259,6 +1376,7 @@ function connect(code) {
       clearTimeout(timer); connected = true;
       try { await ch.track(presencePayload()); } catch (e) {}
       syncPeople(); enterLobby(); updateVoiceBtn();
+      if (voiceOn) broadcastVoiceHello();
     } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
       if (!connected) {
         clearTimeout(timer);
