@@ -883,9 +883,7 @@ function presencePayload() { return { name: me.name, color: me.color, joinedAt, 
 const ICE_SERVERS = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
-  { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
-  { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
-  { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" }
+  { urls: "stun:stun.cloudflare.com:3478" }
 ];
 
 let voiceOn = false, localStream = null, voiceCtx = null, localAnalyser = null;
@@ -894,6 +892,7 @@ let remoteAudioEls = {};
 let remoteAnalysers = {};
 let remoteIceQueues = {};
 let speaking = {};
+let voiceNegotiating = {};
 
 async function toggleVoice() {
   if (!channel || !connected) return;
@@ -919,18 +918,12 @@ async function startVoice() {
   updateVoiceBtn();
   setupLocalAnalyser();
 
-  try {
-    await channel.track(presencePayload());
-  } catch (e) {
+  try { await channel.track(presencePayload()); } catch (e) {
     console.warn("[VOICE] présence vocale:", e);
   }
 
-  // IMPORTANT :
-  // Le démarrage de WebRTC ne dépend plus de Presence.
-  // On annonce explicitement notre présence vocale par Broadcast.
   broadcastVoiceHello();
 
-  // Cas où certains joueurs ont déjà activé leur voix.
   for (const id in people) {
     if (id !== me.id && people[id].voice) maybeConnectVoice(id);
   }
@@ -951,6 +944,7 @@ function stopVoice() {
   }
 
   speaking = {};
+  voiceNegotiating = {};
 
   for (const id in rtcPeers) closeVoicePeer(id);
 
@@ -993,7 +987,10 @@ function ensurePeer(id) {
 
   remoteIceQueues[id] = remoteIceQueues[id] || [];
 
-  pc = rtcPeers[id] = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  pc = rtcPeers[id] = new RTCPeerConnection({
+    iceServers: ICE_SERVERS,
+    iceTransportPolicy: "all"
+  });
 
   console.log("[VOICE] PeerConnection créée:", id);
 
@@ -1002,19 +999,33 @@ function ensurePeer(id) {
   }
 
   pc.onicecandidate = e => {
-    // Envoie les candidats au fur et à mesure.
-    // Le candidat null marque la fin de la collecte ICE.
-    sendRTC(id, "ice", e.candidate ? e.candidate.toJSON() : null);
+    if (e.candidate) {
+      console.log("[VOICE] ICE local:", id, e.candidate.type, e.candidate.protocol);
+      sendRTC(id, "ice", e.candidate.toJSON());
+    } else {
+      console.log("[VOICE] ICE local terminé:", id);
+    }
   };
 
-  pc.ontrack = e => {
-    const stream = e.streams && e.streams[0];
-    console.log("[VOICE] piste distante reçue:", id, stream);
-    if (stream) attachRemoteAudio(id, stream);
+  pc.onicecandidateerror = e => {
+    console.warn(
+      "[VOICE] ERREUR ICE:",
+      id,
+      "code=", e.errorCode,
+      "url=", e.url,
+      "text=", e.errorText
+    );
   };
 
   pc.oniceconnectionstatechange = () => {
     console.log("[VOICE] ICE", id, pc.iceConnectionState);
+
+    if (pc.iceConnectionState === "failed") {
+      console.error("[VOICE] ICE FAILED:", id,
+        "gathering=", pc.iceGatheringState,
+        "signaling=", pc.signalingState
+      );
+    }
   };
 
   pc.onconnectionstatechange = () => {
@@ -1027,6 +1038,16 @@ function ensurePeer(id) {
 
   pc.onsignalingstatechange = () => {
     console.log("[VOICE] signalisation", id, pc.signalingState);
+  };
+
+  pc.onicegatheringstatechange = () => {
+    console.log("[VOICE] ICE gathering", id, pc.iceGatheringState);
+  };
+
+  pc.ontrack = e => {
+    const stream = e.streams && e.streams[0];
+    console.log("[VOICE] piste distante reçue:", id, stream);
+    if (stream) attachRemoteAudio(id, stream);
   };
 
   return pc;
@@ -1058,6 +1079,27 @@ async function sendRTC(to, kind, data) {
   }
 }
 
+function waitForIceGatheringComplete(pc) {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+
+  return new Promise(resolve => {
+    const timeout = setTimeout(() => {
+      console.warn("[VOICE] délai ICE atteint, envoi du SDP actuel");
+      resolve();
+    }, 5000);
+
+    const check = () => {
+      if (pc.iceGatheringState === "complete") {
+        clearTimeout(timeout);
+        pc.removeEventListener("icegatheringstatechange", check);
+        resolve();
+      }
+    };
+
+    pc.addEventListener("icegatheringstatechange", check);
+  });
+}
+
 async function flushRemoteIce(id, pc) {
   const queue = remoteIceQueues[id] || [];
   remoteIceQueues[id] = [];
@@ -1073,29 +1115,37 @@ async function flushRemoteIce(id, pc) {
 
 async function maybeConnectVoice(id) {
   if (!voiceOn || !id || id === me.id) return;
-
-  // Un seul des deux joueurs crée l'offre.
   if (me.id > id) return;
+  if (voiceNegotiating[id]) return;
 
   const pc = ensurePeer(id);
 
   if (pc.signalingState !== "stable") return;
 
+  voiceNegotiating[id] = true;
+
   try {
     console.log("[VOICE] création offre vers", id);
 
-    const offer = await pc.createOffer({
-      offerToReceiveAudio: true
-    });
-
+    const offer = await pc.createOffer({ offerToReceiveAudio: true });
     await pc.setLocalDescription(offer);
 
-    await sendRTC(id, "offer", {
+    // On attend que les candidats ICE soient intégrés au SDP.
+    // Cela évite qu'un message ICE arrive hors ordre via le canal de signalisation.
+    await waitForIceGatheringComplete(pc);
+
+    const description = {
       type: pc.localDescription.type,
       sdp: pc.localDescription.sdp
-    });
+    };
+
+    console.log("[VOICE] offre complète envoyée vers", id);
+    await sendRTC(id, "offer", description);
+
   } catch (e) {
     console.error("[VOICE] création/envoi offre:", id, e);
+  } finally {
+    voiceNegotiating[id] = false;
   }
 }
 
@@ -1104,7 +1154,6 @@ async function handleVoiceHello(p) {
 
   console.log("[VOICE] hello reçu de", p.from);
 
-  // L'unique côté autorisé à créer l'offre démarre maintenant.
   if (me.id < p.from) {
     await maybeConnectVoice(p.from);
   }
@@ -1119,11 +1168,9 @@ async function handleRTC(p) {
     if (p.kind === "offer") {
       console.log("[VOICE] offre reçue de", p.from);
 
-      // Si une ancienne négociation existe, on revient à l'état stable.
       if (pc.signalingState !== "stable") {
-        try {
-          await pc.setLocalDescription({ type: "rollback" });
-        } catch (rollbackError) {
+        try { await pc.setLocalDescription({ type: "rollback" }); }
+        catch (rollbackError) {
           console.warn("[VOICE] rollback:", rollbackError);
         }
       }
@@ -1134,10 +1181,15 @@ async function handleRTC(p) {
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
 
-      await sendRTC(p.from, "answer", {
+      await waitForIceGatheringComplete(pc);
+
+      const description = {
         type: pc.localDescription.type,
         sdp: pc.localDescription.sdp
-      });
+      };
+
+      console.log("[VOICE] réponse complète envoyée à", p.from);
+      await sendRTC(p.from, "answer", description);
 
     } else if (p.kind === "answer") {
       console.log("[VOICE] réponse reçue de", p.from);
@@ -1151,8 +1203,7 @@ async function handleRTC(p) {
       await flushRemoteIce(p.from, pc);
 
     } else if (p.kind === "ice") {
-      // Un ICE peut arriver AVANT l'offre/réponse.
-      // Dans ce cas on le garde jusqu'à setRemoteDescription().
+      // Gardé pour compatibilité avec les clients qui utilisent encore le trickle ICE.
       if (!p.data) return;
 
       if (pc.remoteDescription) {
@@ -1177,6 +1228,7 @@ function closeVoicePeer(id) {
   }
 
   delete remoteIceQueues[id];
+  delete voiceNegotiating[id];
 
   const a = remoteAudioEls[id];
   if (a) {
@@ -1225,9 +1277,7 @@ function attachRemoteAudio(id, stream) {
 
   playRemote();
 
-  a.onloadedmetadata = () => {
-    playRemote();
-  };
+  a.onloadedmetadata = playRemote;
 
   setupRemoteAnalyser(id, stream);
 }
@@ -1236,7 +1286,6 @@ function ensureVoiceCtx() {
   if (!voiceCtx) {
     try {
       voiceCtx = new (window.AudioContext || window.webkitAudioContext)();
-
       if (voiceCtx.state === "suspended") {
         voiceCtx.resume().catch(e => console.warn("[VOICE] AudioContext:", e));
       }
@@ -1292,7 +1341,6 @@ function pollSpeaking(t) {
 
   const level = an => {
     if (!an) return 0;
-
     an.analyser.getByteFrequencyData(an.data);
 
     let s = 0;
@@ -1330,12 +1378,10 @@ function pollSpeaking(t) {
 
   if (changed) {
     $("voiceBtn") && $("voiceBtn").classList.toggle("speaking", !!speaking[me.id]);
-
-    if (phase === "lobby") {
-      renderPeople();
-    }
+    if (phase === "lobby") renderPeople();
   }
 }
+
 
 /* ------------------------------ Réseau (Supabase Realtime) ------------------------------ */
 function disconnect() {
@@ -1362,7 +1408,6 @@ function connect(code) {
     .on("broadcast", { event: "go" }, m => onStart(m.payload))
     .on("broadcast", { event: "voice-hello" }, m => handleVoiceHello(m.payload))
     .on("broadcast", { event: "rtc" }, m => handleRTC(m.payload))
-  .on("broadcast", { event: "voice-hello" }, m => handleVoiceHello(m.payload))
     .on("presence", { event: "sync" }, syncPeople);
   const timer = setTimeout(() => {
     if (ch === channel && !connected) {
