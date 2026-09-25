@@ -1315,8 +1315,6 @@ function syncPeople() {
   }
   people = next;
   for (const id in remotes) if (id[0] !== "b" && !people[id]) delete remotes[id];
-  for (const id in rtcPeers) if (!people[id]) closeVoicePeer(id);
-  for (const id in rtcPeers) if (people[id] && !people[id].voice) closeVoicePeer(id);
   updateRoomControls();
   if (phase === "lobby") renderPeople();
 }
